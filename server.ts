@@ -3,12 +3,45 @@ import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import { z } from "zod";
+import cors from "cors";
+import rateLimit from "express-rate-limit";
 import { Incident, ShuttleRoute, Volunteer, GateMetric, AgentResponse, SystemAlert } from "./src/types/index.ts";
 
 const PORT = 3000;
 const app = express();
 
 app.use(express.json());
+
+// Enable CORS Security with strict defaults
+app.use(cors({
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
+// Apply basic Security Headers (XSS, Sniffing, Frame Injection protection)
+app.use((req: Request, res: Response, next: NextFunction) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
+  res.setHeader("X-XSS-Protection", "1; mode=block");
+  res.setHeader("Referrer-Policy", "no-referrer");
+  next();
+});
+
+// Configure API Rate Limiting using express-rate-limit
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // limit each IP to 100 requests per windowMs
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: {
+    error: "Too many requests, please try again after 15 minutes."
+  }
+});
+
+// Apply rate limiting selectively to API routes
+app.use("/api/agents/command", apiLimiter);
+app.use("/api/incidents", apiLimiter);
 
 // ----------------------------------------------------
 // PRODUCTION LOGGER ABSTRACTION
