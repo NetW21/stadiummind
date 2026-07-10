@@ -1,0 +1,6 @@
+{
+  "name": "StadiumMind AI",
+  "description": "The Autonomous AI Operating System for Smart Stadiums at FIFA World Cup 2026. Powered by autonomous multi-agent systems and real-time operational decision metrics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
