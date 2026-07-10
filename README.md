@@ -19,19 +19,7 @@
 
 </div>
 
----
-
-# 🌍 Live Application
-
-https://stadiummind-ai-11227005249.asia-southeast1.run.app
-
----
-
-# 💻 GitHub Repository
-
-https://github.com/instathoughts7-ai/StadiumMindAI
-
----
+--
 
 # 📖 Overview
 
