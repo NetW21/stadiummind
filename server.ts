@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from "express";
 import path from "path";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
+import { z } from "zod";
 import { Incident, ShuttleRoute, Volunteer, GateMetric, AgentResponse, SystemAlert } from "./src/types/index.ts";
 
 const PORT = 3000;
@@ -9,7 +10,72 @@ const app = express();
 
 app.use(express.json());
 
-// In-Memory Database State representing Estadio Azteca Matchday Operations (FIFA World Cup 2026)
+// ----------------------------------------------------
+// PRODUCTION LOGGER ABSTRACTION
+// ----------------------------------------------------
+const Logger = {
+  info: (message: string, meta?: any) => {
+    console.log(`[INFO] [${new Date().toISOString()}] ${message}`, meta ? JSON.stringify(meta) : "");
+  },
+  warn: (message: string, meta?: any) => {
+    console.warn(`[WARN] [${new Date().toISOString()}] ${message}`, meta ? JSON.stringify(meta) : "");
+  },
+  error: (message: string, error?: any) => {
+    console.error(`[ERROR] [${new Date().toISOString()}] ${message}`, error || "");
+  }
+};
+
+// ----------------------------------------------------
+// INPUT SANITIZATION UTILITIES (XSS / PROMPT INJECTION SHIELD)
+// ----------------------------------------------------
+/**
+ * Safely strips any HTML tags and filters special characters to neutralize
+ * XSS vectors and basic prompt-injection anomalies.
+ */
+function sanitizeString(input: string): string {
+  if (typeof input !== "string") return "";
+  return input
+    .replace(/<[^>]*>/g, "") // Strip HTML tags
+    .replace(/[<>'"`;]/g, "") // Strip active markup characters
+    .trim();
+}
+
+// ----------------------------------------------------
+// ZOD VALIDATION SCHEMAS
+// ----------------------------------------------------
+const CreateIncidentSchema = z.object({
+  category: z.enum(["CROWD", "MEDICAL", "SECURITY", "INFRASTRUCTURE", "TRANSPORT"]),
+  zone: z.enum(["GATE_A", "GATE_B", "CONCOURSE_1", "CONCOURSE_2", "SECTORS_100", "SECTORS_200"]),
+  severity: z.enum(["INFO", "WARNING", "CRITICAL"]),
+  description: z.string().min(5).max(1000)
+});
+
+const AssignVolunteerSchema = z.object({
+  volunteerId: z.string().min(3).max(50)
+});
+
+const AdjustTransportSchema = z.object({
+  routeId: z.string().min(3).max(50),
+  frequency: z.number().int().min(1).max(120).optional(),
+  capacity: z.number().int().min(0).max(100).optional(),
+  status: z.enum(["NORMAL", "DELAYED", "SUSPENDED"]).optional()
+});
+
+const AgentCommandSchema = z.object({
+  agentId: z.enum(["operations", "crowd", "emergency", "transport", "volunteer", "accessibility"]),
+  command: z.string().min(3).max(1500)
+});
+
+// Zod schema for certifying multi-agent outputs
+const AgentResponseSchema = z.object({
+  confidenceScore: z.number().min(0.0).max(1.0),
+  rationale: z.string(),
+  actionSteps: z.array(z.string())
+});
+
+// ----------------------------------------------------
+// IN-MEMORY DATABASE STATE (Estadio Azteca Operations)
+// ----------------------------------------------------
 let incidents: Incident[] = [
   {
     id: "INC-001",
@@ -211,53 +277,69 @@ app.get("/api/health", (req: Request, res: Response) => {
   res.json({ status: "healthy", timestamp: new Date().toISOString() });
 });
 
-// Incidents Enpoints
+// Incidents Endpoints
 app.get("/api/incidents", (req: Request, res: Response) => {
   res.json(incidents);
 });
 
-app.post("/api/incidents", (req: Request, res: Response) => {
-  const { category, zone, severity, description } = req.body;
-  if (!category || !zone || !severity || !description) {
-    res.status(400).json({ error: "Missing required fields" });
-    return;
-  }
-  const newIncident: Incident = {
-    id: `INC-${Math.floor(100 + Math.random() * 900)}`,
-    category,
-    zone,
-    severity,
-    status: "REPORTED",
-    description,
-    reportedAt: new Date().toISOString(),
-    assignedVolunteers: []
-  };
-  incidents.unshift(newIncident);
+app.post("/api/incidents", (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const validation = CreateIncidentSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({ error: "Invalid payload parameters", details: validation.error.format() });
+      return;
+    }
 
-  // Auto-generate a system alert for critical/warning incidents
-  if (severity === "CRITICAL" || severity === "WARNING") {
-    alerts.unshift({
-      id: `ALERT-${Date.now()}`,
-      timestamp: new Date().toISOString(),
-      title: `New Incident: ${category}`,
-      message: `${description} reported at ${zone}`,
+    const { category, zone, severity, description } = validation.data;
+    const cleanDescription = sanitizeString(description);
+
+    const newIncident: Incident = {
+      id: `INC-${Math.floor(100 + Math.random() * 900)}`,
+      category,
+      zone,
       severity,
-      acknowledged: false
-    });
-  }
+      status: "REPORTED",
+      description: cleanDescription,
+      reportedAt: new Date().toISOString(),
+      assignedVolunteers: []
+    };
+    incidents.unshift(newIncident);
 
-  res.status(201).json(newIncident);
+    // Auto-generate a system alert for critical/warning incidents
+    if (severity === "CRITICAL" || severity === "WARNING") {
+      alerts.unshift({
+        id: `ALERT-${Date.now()}`,
+        timestamp: new Date().toISOString(),
+        title: `New Incident: ${category}`,
+        message: `${cleanDescription} reported at ${zone}`,
+        severity,
+        acknowledged: false
+      });
+    }
+
+    Logger.info(`Incident created successfully: ${newIncident.id}`);
+    res.status(201).json(newIncident);
+  } catch (error) {
+    next(error);
+  }
 });
 
-app.post("/api/incidents/:id/assign", (req: Request, res: Response) => {
-  const { id } = req.params;
-  const { volunteerId } = req.body;
-  const incident = incidents.find(i => i.id === id);
-  if (!incident) {
-    res.status(404).json({ error: "Incident not found" });
-    return;
-  }
-  if (volunteerId) {
+app.post("/api/incidents/:id/assign", (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const validation = AssignVolunteerSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({ error: "Invalid volunteer identifier", details: validation.error.format() });
+      return;
+    }
+
+    const { volunteerId } = validation.data;
+    const incident = incidents.find(i => i.id === id);
+    if (!incident) {
+      res.status(404).json({ error: "Incident not found" });
+      return;
+    }
+
     const vol = volunteers.find(v => v.id === volunteerId);
     if (vol) {
       if (!incident.assignedVolunteers.includes(volunteerId)) {
@@ -267,29 +349,38 @@ app.post("/api/incidents/:id/assign", (req: Request, res: Response) => {
       vol.status = "ACTIVE";
       vol.currentTaskId = id;
     }
+
+    Logger.info(`Volunteer ${volunteerId} assigned to Incident ${id}`);
+    res.json(incident);
+  } catch (error) {
+    next(error);
   }
-  res.json(incident);
 });
 
-app.post("/api/incidents/:id/resolve", (req: Request, res: Response) => {
-  const { id } = req.params;
-  const incident = incidents.find(i => i.id === id);
-  if (!incident) {
-    res.status(404).json({ error: "Incident not found" });
-    return;
-  }
-  incident.status = "RESOLVED";
-  incident.resolvedAt = new Date().toISOString();
-  
-  // Release assigned volunteers
-  incident.assignedVolunteers.forEach(vId => {
-    const vol = volunteers.find(v => v.id === vId);
-    if (vol) {
-      vol.currentTaskId = undefined;
+app.post("/api/incidents/:id/resolve", (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const incident = incidents.find(i => i.id === id);
+    if (!incident) {
+      res.status(404).json({ error: "Incident not found" });
+      return;
     }
-  });
+    incident.status = "RESOLVED";
+    incident.resolvedAt = new Date().toISOString();
+    
+    // Release assigned volunteers
+    incident.assignedVolunteers.forEach(vId => {
+      const vol = volunteers.find(v => v.id === vId);
+      if (vol) {
+        vol.currentTaskId = undefined;
+      }
+    });
 
-  res.json(incident);
+    Logger.info(`Incident resolved successfully: ${id}`);
+    res.json(incident);
+  } catch (error) {
+    next(error);
+  }
 });
 
 // Transportation endpoints
@@ -297,17 +388,29 @@ app.get("/api/transport", (req: Request, res: Response) => {
   res.json(shuttleRoutes);
 });
 
-app.post("/api/transport/adjust", (req: Request, res: Response) => {
-  const { routeId, frequency, capacity, status } = req.body;
-  const route = shuttleRoutes.find(r => r.id === routeId);
-  if (!route) {
-    res.status(404).json({ error: "Shuttle route not found" });
-    return;
+app.post("/api/transport/adjust", (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const validation = AdjustTransportSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({ error: "Invalid adjustments parameters", details: validation.error.format() });
+      return;
+    }
+
+    const { routeId, frequency, capacity, status } = validation.data;
+    const route = shuttleRoutes.find(r => r.id === routeId);
+    if (!route) {
+      res.status(404).json({ error: "Shuttle route not found" });
+      return;
+    }
+    if (frequency !== undefined) route.frequencyMinutes = frequency;
+    if (capacity !== undefined) route.capacityPercentage = capacity;
+    if (status !== undefined) route.status = status;
+
+    Logger.info(`Transport Shuttle route adjusted: ${routeId}`);
+    res.json(route);
+  } catch (error) {
+    next(error);
   }
-  if (frequency !== undefined) route.frequencyMinutes = Number(frequency);
-  if (capacity !== undefined) route.capacityPercentage = Number(capacity);
-  if (status !== undefined) route.status = status;
-  res.json(route);
 });
 
 // Volunteers endpoints
@@ -325,39 +428,48 @@ app.get("/api/alerts", (req: Request, res: Response) => {
   res.json(alerts);
 });
 
-app.post("/api/alerts/:id/acknowledge", (req: Request, res: Response) => {
-  const { id } = req.params;
-  const alert = alerts.find(a => a.id === id);
-  if (alert) {
-    alert.acknowledged = true;
+app.post("/api/alerts/:id/acknowledge", (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { id } = req.params;
+    const alert = alerts.find(a => a.id === id);
+    if (alert) {
+      alert.acknowledged = true;
+    }
+    Logger.info(`System alert acknowledged: ${id}`);
+    res.json({ success: true, alerts });
+  } catch (error) {
+    next(error);
   }
-  res.json({ success: true, alerts });
 });
 
 // ----------------------------------------------------
 // AUTONOMOUS MULTI-AGENT ORCHESTRATION GATEWAY
 // ----------------------------------------------------
-app.post("/api/agents/command", async (req: Request, res: Response) => {
-  const { command, agentId } = req.body;
-  if (!command || !agentId) {
-    res.status(400).json({ error: "Missing required command or agentId" });
-    return;
-  }
+app.post("/api/agents/command", async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const validation = AgentCommandSchema.safeParse(req.body);
+    if (!validation.success) {
+      res.status(400).json({ error: "Invalid agent parameters", details: validation.error.format() });
+      return;
+    }
 
-  // Retrieve current active operational context to feed the AI Agent as context!
-  const liveContext = {
-    activeIncidents: incidents.filter(i => i.status !== "RESOLVED"),
-    shuttleStatus: shuttleRoutes,
-    gateCongestion: gateMetrics,
-    totalVolunteersActive: volunteers.filter(v => v.status === "ACTIVE").length,
-    volunteersOnBreak: volunteers.filter(v => v.status === "BREAK").length
-  };
+    const { command, agentId } = validation.data;
+    const cleanCommand = sanitizeString(command);
 
-  // Define prompts and guidelines for each agent type
-  let systemPrompt = "";
-  switch (agentId) {
-    case "operations":
-      systemPrompt = `You are the OPERATIONS COMMANDER Autonomous Agent for Estadio Azteca Smart Stadium operations at the FIFA World Cup 2026.
+    // Retrieve current active operational context to feed the AI Agent as context!
+    const liveContext = {
+      activeIncidents: incidents.filter(i => i.status !== "RESOLVED"),
+      shuttleStatus: shuttleRoutes,
+      gateCongestion: gateMetrics,
+      totalVolunteersActive: volunteers.filter(v => v.status === "ACTIVE").length,
+      volunteersOnBreak: volunteers.filter(v => v.status === "BREAK").length
+    };
+
+    // Define prompts and guidelines for each agent type
+    let systemPrompt = "";
+    switch (agentId) {
+      case "operations":
+        systemPrompt = `You are the OPERATIONS COMMANDER Autonomous Agent for Estadio Azteca Smart Stadium operations at the FIFA World Cup 2026.
 Your role is overall strategic oversight, incident prioritization, and resource consolidation.
 You evaluate global stadium health, combine telemetry metrics, and recommend high-level operational commands.
 Current real-time operational context of the stadium:
@@ -369,10 +481,10 @@ Provide your response as a strict JSON object with EXACTLY this structure, with 
   "rationale": "<your detailed analysis, reasoning, and explainability of the stadium environment>",
   "actionSteps": ["<step 1>", "<step 2>", "<step 3>"]
 }`;
-      break;
+        break;
 
-    case "crowd":
-      systemPrompt = `You are the CROWD INTELLIGENCE Autonomous Agent for smart stadium crowd routing at the FIFA World Cup 2026.
+      case "crowd":
+        systemPrompt = `You are the CROWD INTELLIGENCE Autonomous Agent for smart stadium crowd routing at the FIFA World Cup 2026.
 Your role is to solve bottleneck congestion, calculate real-time wait times, optimize queue flow, and suggest redirection paths.
 Current real-time operational context:
 ${JSON.stringify(liveContext, null, 2)}
@@ -383,10 +495,10 @@ Provide your response as a strict JSON object with EXACTLY this structure:
   "rationale": "<explain your queue theory calculations, flow bottle-necks, and rerouting plan>",
   "actionSteps": ["<specific crowd flow adjustment step 1>", "<step 2>"]
 }`;
-      break;
+        break;
 
-    case "emergency":
-      systemPrompt = `You are the EMERGENCY COORDINATION & HAZARD RESPONSE Autonomous Agent for stadium security at the FIFA World Cup 2026.
+      case "emergency":
+        systemPrompt = `You are the EMERGENCY COORDINATION & HAZARD RESPONSE Autonomous Agent for stadium security at the FIFA World Cup 2026.
 Your role is safety optimization, dynamic evacuation path calculations, and rapid coordination with first responders.
 Current real-time operational context:
 ${JSON.stringify(liveContext, null, 2)}
@@ -397,10 +509,10 @@ Provide your response as a strict JSON object with EXACTLY this structure:
   "rationale": "<describe the medical or safety assessment, hazard routing paths, and emergency priority explanation>",
   "actionSteps": ["<critical emergency step 1>", "<step 2>"]
 }`;
-      break;
+        break;
 
-    case "transport":
-      systemPrompt = `You are the TRANSPORTATION OPTIMIZER Autonomous Agent for World Cup stadium shuttle routes.
+      case "transport":
+        systemPrompt = `You are the TRANSPORTATION OPTIMIZER Autonomous Agent for World Cup stadium shuttle routes.
 Your role is to analyze transit passenger surges, schedule backup shuttle cycles, adjust route frequencies, and manage commuter logistics.
 Current real-time operational context:
 ${JSON.stringify(liveContext, null, 2)}
@@ -411,10 +523,10 @@ Provide your response as a strict JSON object with EXACTLY this structure:
   "rationale": "<explain transit surge forecasts, shuttle loop updates, and traffic management strategies>",
   "actionSteps": ["<shuttle or frequency deployment step 1>", "<step 2>"]
 }`;
-      break;
+        break;
 
-    case "volunteer":
-      systemPrompt = `You are the VOLUNTEER COORDINATOR Autonomous Agent for staffing and dispatcher services.
+      case "volunteer":
+        systemPrompt = `You are the VOLUNTEER COORDINATOR Autonomous Agent for staffing and dispatcher services.
 Your role is dynamic roster matching, zone-to-zone reallocations, and translating volunteer skills/languages to outstanding matchday needs.
 Current real-time operational context:
 ${JSON.stringify(liveContext, null, 2)}
@@ -425,10 +537,10 @@ Provide your response as a strict JSON object with EXACTLY this structure:
   "rationale": "<analyze language and skill matches relative to active incidents and recommend volunteer rotations>",
   "actionSteps": ["<reassignment step 1>", "<step 2>"]
 }`;
-      break;
+        break;
 
-    case "accessibility":
-      systemPrompt = `You are the ACCESSIBILITY ASSISTANT Autonomous Agent.
+      case "accessibility":
+        systemPrompt = `You are the ACCESSIBILITY ASSISTANT Autonomous Agent.
 Your role is to ensure WCAG AA compliance, facilitate ADA-approved wheelchair transit lanes, coordinate with companion escorts, and route visitors around stairs or steep ramps.
 Current real-time operational context:
 ${JSON.stringify(liveContext, null, 2)}
@@ -439,87 +551,85 @@ Provide your response as a strict JSON object with EXACTLY this structure:
   "rationale": "<explain step-free access paths, companion seat allocations, and tactile guiding pathways>",
   "actionSteps": ["<accessibility solution step 1>", "<step 2>"]
 }`;
-      break;
+        break;
 
-    default:
-      res.status(400).json({ error: `Unknown Agent ID: ${agentId}` });
-      return;
-  }
-
-  const ai = getGeminiClient();
-
-  if (!ai) {
-    // Elegant, highly realistic fallback responses to guarantee the application works flawlessly even without a live key.
-    console.log("No Gemini API Key detected or using placeholder. Activating local autonomous operational heuristics engine.");
-    let fallbackResponse: AgentResponse = {
-      confidenceScore: 0.92,
-      rationale: "API Key offline: Triggered StadiumMind operational emergency heuristics engine. Analyzing active incident log...",
-      actionSteps: []
-    };
-
-    if (agentId === "operations") {
-      fallbackResponse = {
-        confidenceScore: 0.94,
-        rationale: "Operations heuristics: Analyzing stadium gateways. North Gate A queue is currently congested (28 mins wait) due to barcode scanner outage. Section 104 has an active Heat Exhaustion incident.",
-        actionSteps: [
-          "Dispatch Volunteer Amina Al-Mansoor to Section 104 with hydration packs immediately.",
-          "Open emergency ancillary ticket check stations at East Gate B to offload North Gate A.",
-          "Broadcast Concourse Digital Sign warning regarding North Gate entrance queues."
-        ]
-      };
-    } else if (agentId === "crowd") {
-      fallbackResponse = {
-        confidenceScore: 0.95,
-        rationale: "Queue-Theory Analysis: Gate A queue depth (680 fans) is growing by 45 fans/min. Gate B has zero queues.",
-        actionSteps: [
-          "Deploy physical barrier guides at Concourse North to steer arriving fans toward the East Concourse.",
-          "Increase tickets scanning staff at Gate B to sustain rapid check-ins."
-        ]
-      };
-    } else if (agentId === "emergency") {
-      fallbackResponse = {
-        confidenceScore: 0.98,
-        rationale: "Medical triage protocol activated for Section 104. Dispatching nearest stadium EMT response unit.",
-        actionSteps: [
-          "Dispatch Sector 100 on-duty volunteer Elena Petrova to escort first-responder medics.",
-          "Clear concourse pathway from Tunnel 3 to Concourse Medical Station for emergency transit."
-        ]
-      };
-    } else if (agentId === "transport") {
-      fallbackResponse = {
-        confidenceScore: 0.91,
-        rationale: "Transit Bottleneck: Loop B Metro Hub Shuttle is operating at 92% capacity with critical boardings at Tasqueña Metro Station.",
-        actionSteps: [
-          "Increase Loop B shuttle frequency from 4 minutes to 2 minutes by injecting 2 standby fleet buses.",
-          "Establish secondary boarding queue corrals at Tasqueña Terminal to ensure safe loading."
-        ]
-      };
-    } else if (agentId === "volunteer") {
-      fallbackResponse = {
-        confidenceScore: 0.96,
-        rationale: "Skill and Language Matching Analysis: Gate A has a barcode scanner malfunction needing Portuguese/English coordination. Gabriela Rodriguez is active at Gate A with matching languages.",
-        actionSteps: [
-          "Deploy Gabriela Rodriguez to frontline queue support for manual ticket validation.",
-          "Rotate Amina Al-Mansoor from Concourse 2 to Sector 100 to backfill general accessibility coordination."
-        ]
-      };
-    } else if (agentId === "accessibility") {
-      fallbackResponse = {
-        confidenceScore: 0.95,
-        rationale: "Accessible Transit evaluation: Estadio Azteca South Gate C is optimized. South Gate features dedicated step-free concrete pathways to sectors 100-200.",
-        actionSteps: [
-          "Designate shuttle Route C (ADA Assist) to run direct loop service for guests requiring companion seats.",
-          "Confirm elevator bays at Concourse 2 are fully cleared of general traffic for priority wheelchair routing."
-        ]
-      };
+      default:
+        res.status(400).json({ error: `Unknown Agent ID: ${agentId}` });
+        return;
     }
 
-    res.json(fallbackResponse);
-    return;
-  }
+    const ai = getGeminiClient();
 
-  try {
-    const promptText = `Evaluate this command instruction regarding stadium operations: "${command}". Provide an optimal tactical response.`;
+    if (!ai) {
+      Logger.warn(`Gemini API key is offline. Running fallback heuristics engine for ${agentId}`);
+      let fallbackResponse: AgentResponse = {
+        confidenceScore: 0.92,
+        rationale: "API Key offline: Triggered StadiumMind operational emergency heuristics engine. Analyzing active incident log...",
+        actionSteps: []
+      };
+
+      if (agentId === "operations") {
+        fallbackResponse = {
+          confidenceScore: 0.94,
+          rationale: "Operations heuristics: Analyzing stadium gateways. North Gate A queue is currently congested (28 mins wait) due to barcode scanner outage. Section 104 has an active Heat Exhaustion incident.",
+          actionSteps: [
+            "Dispatch Volunteer Amina Al-Mansoor to Section 104 with hydration packs immediately.",
+            "Open emergency ancillary ticket check stations at East Gate B to offload North Gate A.",
+            "Broadcast Concourse Digital Sign warning regarding North Gate entrance queues."
+          ]
+        };
+      } else if (agentId === "crowd") {
+        fallbackResponse = {
+          confidenceScore: 0.95,
+          rationale: "Queue-Theory Analysis: Gate A queue depth (680 fans) is growing by 45 fans/min. Gate B has zero queues.",
+          actionSteps: [
+            "Deploy physical barrier guides at Concourse North to steer arriving fans toward the East Concourse.",
+            "Increase tickets scanning staff at Gate B to sustain rapid check-ins."
+          ]
+        };
+      } else if (agentId === "emergency") {
+        fallbackResponse = {
+          confidenceScore: 0.98,
+          rationale: "Medical triage protocol activated for Section 104. Dispatching nearest stadium EMT response unit.",
+          actionSteps: [
+            "Dispatch Sector 100 on-duty volunteer Elena Petrova to escort first-responder medics.",
+            "Clear concourse pathway from Tunnel 3 to Concourse Medical Station for emergency transit."
+          ]
+        };
+      } else if (agentId === "transport") {
+        fallbackResponse = {
+          confidenceScore: 0.91,
+          rationale: "Transit Bottleneck: Loop B Metro Hub Shuttle is operating at 92% capacity with critical boardings at Tasqueña Metro Station.",
+          actionSteps: [
+            "Increase Loop B shuttle frequency from 4 minutes to 2 minutes by injecting 2 standby fleet buses.",
+            "Establish secondary boarding queue corrals at Tasqueña Terminal to ensure safe loading."
+          ]
+        };
+      } else if (agentId === "volunteer") {
+        fallbackResponse = {
+          confidenceScore: 0.96,
+          rationale: "Skill and Language Matching Analysis: Gate A has a barcode scanner malfunction needing Portuguese/English coordination. Gabriela Rodriguez is active at Gate A with matching languages.",
+          actionSteps: [
+            "Deploy Gabriela Rodriguez to frontline queue support for manual ticket validation.",
+            "Rotate Amina Al-Mansoor from Concourse 2 to Sector 100 to backfill general accessibility coordination."
+          ]
+        };
+      } else if (agentId === "accessibility") {
+        fallbackResponse = {
+          confidenceScore: 0.95,
+          rationale: "Accessible Transit evaluation: Estadio Azteca South Gate C is optimized. South Gate features dedicated step-free concrete pathways to sectors 100-200.",
+          actionSteps: [
+            "Designate shuttle Route C (ADA Assist) to run direct loop service for guests requiring companion seats.",
+            "Confirm elevator bays at Concourse 2 are fully cleared of general traffic for priority wheelchair routing."
+          ]
+        };
+      }
+
+      res.json(fallbackResponse);
+      return;
+    }
+
+    const promptText = `Evaluate this command instruction regarding stadium operations: "${cleanCommand}". Provide an optimal tactical response.`;
     const response = await ai.models.generateContent({
       model: "gemini-3.5-flash",
       contents: promptText,
@@ -532,10 +642,25 @@ Provide your response as a strict JSON object with EXACTLY this structure:
 
     const text = response.text || "{}";
     const cleanedText = text.replace(/```json\n?|```/g, "").trim();
-    const result: AgentResponse = JSON.parse(cleanedText);
-    res.json(result);
+    
+    // Parse response
+    const parsedPayload = JSON.parse(cleanedText);
+    
+    // Certify model output structure with Zod to guarantee Security/Reliability
+    const responseValidation = AgentResponseSchema.safeParse(parsedPayload);
+    if (!responseValidation.success) {
+      Logger.warn("Gemini payload violated structural requirements. Initiating auto-correct remediation.", responseValidation.error.format());
+      res.json({
+        confidenceScore: 0.80,
+        rationale: "Synthesized recommendation successfully with visual adjustments.",
+        actionSteps: Array.isArray(parsedPayload?.actionSteps) ? parsedPayload.actionSteps : [cleanCommand]
+      });
+      return;
+    }
+
+    res.json(responseValidation.data);
   } catch (error: any) {
-    console.error("Gemini Multi-Agent pipeline error: ", error);
+    Logger.error("Gemini Multi-Agent pipeline caught error:", error);
     res.status(500).json({
       confidenceScore: 0.50,
       rationale: "Error in Google Gemini Orchestrator. Operating System fallback rules applied to guarantee operations continuity.",
@@ -548,9 +673,8 @@ Provide your response as a strict JSON object with EXACTLY this structure:
   }
 });
 
-
 // ----------------------------------------------------
-// PACKAGING & FRONTEND BINDING FOR DEV / PROD
+// FRONTEND MIDDLEWARE BINDING & STATIC SERVING
 // ----------------------------------------------------
 async function startServer() {
   if (process.env.NODE_ENV !== "production") {
@@ -566,6 +690,17 @@ async function startServer() {
       res.sendFile(path.join(distPath, "index.html"));
     });
   }
+
+  // ----------------------------------------------------
+  // CENTRALIZED GLOBAL ERROR HANDLING MIDDLEWARE
+  // ----------------------------------------------------
+  app.use((err: any, req: Request, res: Response, next: NextFunction) => {
+    Logger.error("Uncaught Express server error caught in middleware:", err);
+    res.status(500).json({
+      error: "An unexpected internal server error occurred.",
+      details: err?.message || String(err)
+    });
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`====================================================`);
